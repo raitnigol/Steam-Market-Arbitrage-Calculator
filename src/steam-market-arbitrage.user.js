@@ -1,19 +1,19 @@
 // ==UserScript==
 // @name         Steam Market Arbitrage Calculator (SIH)
-// @namespace    https://github.com/raitnigol/steam-market-arbitrage
+// @namespace    https://github.com/raitnigol/Steam-Market-Arbitrage-Calculator
 // @version      1.0.0
-// @description  Automated arbitrage calculator for Steam Community Market using SIH prices. Features profit tracking, dynamic fees, stats, and Steam hardware goals.
+// @description  Automated arbitrage calculator for the Steam Community Market (using SIH prices) with dynamic fees, profit tracking, stats, and hardware goals.
 // @author       Rait Nigol
 // @homepage     https://nigol.ee
 // @supportURL   https://github.com/raitnigol/Steam-Market-Arbitrage-Calculator/issues
 // @updateURL    https://raw.githubusercontent.com/raitnigol/Steam-Market-Arbitrage-Calculator/main/steam-market-arbitrage.user.js
 // @downloadURL  https://raw.githubusercontent.com/raitnigol/Steam-Market-Arbitrage-Calculator/main/steam-market-arbitrage.user.js
+// @icon         https://store.steampowered.com/favicon.ico
 // @match        https://steamcommunity.com/market/listings/*
 // @grant        GM.setValue
 // @grant        GM.getValue
 // @grant        GM.notification
 // @license      Unlicense
-// @icon         https://store.steampowered.com/favicon.ico
 // ==/UserScript==
 
 (async function () {
