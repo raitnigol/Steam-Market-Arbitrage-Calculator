@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam Market Arbitrage Calculator (SIH)
 // @namespace    https://github.com/raitnigol/Steam-Market-Arbitrage-Calculator
-// @version      1.0.1
+// @version      1.0.2
 // @description  Automated arbitrage calculator for the Steam Community Market (using SIH prices) with dynamic fees, profit tracking, stats, and hardware goals.
 // @author       Rait Nigol
 // @homepage     https://nigol.ee
