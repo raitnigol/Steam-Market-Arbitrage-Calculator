@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam Market Arbitrage Calculator (SIH)
 // @namespace    https://github.com/raitnigol/Steam-Market-Arbitrage-Calculator
-// @version      1.0.0
+// @version      1.0.1
 // @description  Automated arbitrage calculator for the Steam Community Market (using SIH prices) with dynamic fees, profit tracking, stats, and hardware goals.
 // @author       Rait Nigol
 // @homepage     https://nigol.ee
@@ -10,676 +10,313 @@
 // @downloadURL  https://raw.githubusercontent.com/raitnigol/Steam-Market-Arbitrage-Calculator/main/steam-market-arbitrage.user.js
 // @icon         https://store.steampowered.com/favicon.ico
 // @match        https://steamcommunity.com/market/listings/*
+// @require      https://code.jquery.com/jquery-3.6.0.min.js
 // @grant        GM.setValue
 // @grant        GM.getValue
 // @grant        GM.notification
 // @license      Unlicense
 // ==/UserScript==
 
-(async function () {
-    'use strict';
+(async () => {
+  'use strict';
 
-    /*************************************
-     *          GM STORAGE KEYS
-     *************************************/
-    const DATA_KEY               = "steamListingTracker_DATA";
-    const LAST_RESET_TIME_KEY    = "steamListingTracker_LAST_RESET_TIME";
-    const RESET_INTERVAL_KEY     = "steamListingTracker_RESET_INTERVAL";
-    const PROFIT_THRESHOLD_KEY   = "steamListingTracker_PROFIT_THRESHOLD";
+  /*--- CONSTANTS & DEFAULTS ---*/
+  const DATA_KEY               = "steamListingTracker_DATA",
+        LAST_RESET_TIME_KEY    = "steamListingTracker_LAST_RESET_TIME",
+        RESET_INTERVAL_KEY     = "steamListingTracker_RESET_INTERVAL",
+        PROFIT_THRESHOLD_KEY   = "steamListingTracker_PROFIT_THRESHOLD",
+        DEFAULT_RESET_INTERVAL = 6 * 3600000,   // 6 hours
+        DEFAULT_PROFIT_THRESH  = 0,
+        REQUEST_DELAY          = 5000,
+        MAX_RETRIES            = 5,
+        MAX_BACKOFF            = 30000,
+        CACHE_EXPIRATION       = 30 * 60000,
+        DEBUG_LOGGING          = true,
+        STEAM_DECK_PRICE       = 569,
+        VR_KIT_PRICE           = 1079;
 
-    // Default settings if not found in GM
-    const DEFAULT_RESET_INTERVAL   = 6 * 60 * 60 * 1000; // 6 hours
-    const DEFAULT_PROFIT_THRESHOLD = 0; // 0% by default
+  let lastRequestTime = 0,
+      cache           = {},
+      currentPageUrl  = location.href;
 
-    /*************************************
-     *             CONSTANTS
-     *************************************/
-    const REQUEST_DELAY     = 5000;  // Min delay between requests
-    const MAX_RETRIES       = 5;     // Max retries for fetch
-    const MAX_BACKOFF_TIME  = 30000; // 30 seconds cap
-    const CACHE_EXPIRATION  = 30 * 60 * 1000; // 30 minutes
-    const DEBUG_LOGGING     = true;  // Set false to reduce console chatter
+  /*--- LOG WRAPPERS ---*/
+  const log = {
+    d: (...a) => DEBUG_LOGGING && console.debug("[SteamTracker]", ...a),
+    i: (...a) => console.info("[SteamTracker]", ...a),
+    w: (...a) => console.warn("[SteamTracker]", ...a),
+    e: (...a) => console.error("[SteamTracker]", ...a)
+  };
 
-    // For "Goals" calculations
-    const STEAM_DECK_PRICE  = 569;   // Steam Deck OLED 512GB
-    const VR_KIT_PRICE      = 1079;  // Valve Index VR Kit
-
-    /*************************************
-     *      IN-MEMORY RUNTIME VARIABLES
-     *************************************/
-    let lastRequestTime = 0;
-    const cache         = {}; // In-memory cache for session
-    let currentPageUrl  = window.location.href;
-
-    /*************************************
-     *       HELPER: LOGGING WRAPPER
-     *************************************/
-    function logDebug(...args) {
-        if (DEBUG_LOGGING) console.debug("[SteamTracker][DEBUG]", ...args);
+  /*--- HELPER: WAIT FOR ELEM (jQuery) ---*/
+  const waitForElement = async (sel, t = 10000) => {
+    for (let i=0; i<(t/100); i++) {
+      let $el = $(sel);
+      if ($el.length) return $el.first();
+      await new Promise(r => setTimeout(r, 100));
     }
-    function logInfo(...args) {
-        console.info("[SteamTracker][INFO]", ...args);
+    throw new Error(`Element not found: ${sel}`);
+  };
+
+  /*--- PAGE / URL / GAME DETECTION ---*/
+  const parseItemIdFromUrl = () => {
+    let m = location.pathname.match(/\/market\/listings\/(\d+)\/(.+)/);
+    return m ? {appId:m[1], itemNameEncoded:m[2]} : {appId:null,itemNameEncoded:null};
+  };
+  const detectGame = () => {
+    let $g = $("#largeiteminfo_game_name");
+    return $g.length ? $g.text().trim() : "default";
+  };
+  const isPageChanged = () => location.href !== currentPageUrl;
+
+  /*--- FEE CALC ---*/
+  const calcFee = (buyerPays) => {
+    let rate = (buyerPays <= 1.0) ? (0.20 - buyerPays*0.08) : 0.13;
+    rate = Math.max(0.12, Math.min(rate, 0.20));
+    let net = buyerPays*(1-rate), net15 = buyerPays*0.85;
+    return {
+      net:  Math.floor(net*100)/100,
+      net15:Math.floor(net15*100)/100,
+      rate
+    };
+  };
+
+  /*--- RESET IF NEEDED ---*/
+  const resetIfNeeded = async () => {
+    let lr  = await GM.getValue(LAST_RESET_TIME_KEY, null),
+        now = Date.now(),
+        int = await GM.getValue(RESET_INTERVAL_KEY, DEFAULT_RESET_INTERVAL);
+    if (!lr || (now - new Date(lr).getTime() > int)) {
+      log.i("Reset DB (interval).");
+      await GM.setValue(DATA_KEY, []);
+      await GM.setValue(LAST_RESET_TIME_KEY, new Date().toISOString());
     }
-    function logError(...args) {
-        console.error("[SteamTracker][ERROR]", ...args);
+  };
+
+  /*--- FETCH w/ RETRIES ---*/
+  const fetchRetry = async (url) => {
+    let delay=1000;
+    for (let i=0; i<MAX_RETRIES; i++) {
+      if (isPageChanged()) { log.i("Page changed, stop fetch."); return null; }
+      let dms = Date.now() - lastRequestTime;
+      if (dms < REQUEST_DELAY) await new Promise(r=>setTimeout(r,REQUEST_DELAY-dms));
+      lastRequestTime=Date.now();
+      try {
+        let res=await fetch(url);
+        if (res.ok) { delay=1000; return res.json(); }
+        if (res.status===429) {
+          log.w(`429, retry in ${delay}ms (attempt ${i+1}).`);
+          await new Promise(r=>setTimeout(r,delay));
+          delay=Math.min(delay*2,MAX_BACKOFF);
+        } else throw new Error(`HTTP error: ${res.status}`);
+      } catch(e){ log.e(`Fetch attempt ${i+1} fail`, e); }
     }
-    function logWarn(...args) {
-        console.warn("[SteamTracker][WARN]", ...args);
+    log.e("All fetch attempts fail:", url);
+    return null;
+  };
+
+  /*--- GET / SET DATA ---*/
+  const getCachedData = async (id) => {
+    if (cache[id] && (Date.now()-cache[id].ts < CACHE_EXPIRATION)) return cache[id].data;
+    let data=await fetchRetry(`https://steamcommunity.com/market/itemordersactivity?item_nameid=${id}`);
+    if (data) cache[id]={data, ts:Date.now()};
+    return data;
+  };
+  const addOrUpdateItem = async (item) => {
+    let items = await GM.getValue(DATA_KEY, []);
+    let ix = items.findIndex(it=>it.name===item.name);
+    (ix>-1) ? items[ix]=item : items.push(item);
+    await GM.setValue(DATA_KEY, items);
+  };
+
+  /*--- UI / DB OPS ---*/
+  const removeItem = async (name) => {
+    let items = await GM.getValue(DATA_KEY, []);
+    items = items.filter(i=>i.name!==name);
+    await GM.setValue(DATA_KEY, items);
+    displayUI();
+  };
+  const removeAll = async () => { await GM.setValue(DATA_KEY,[]); displayUI(); };
+
+  const showError = (msg) => {
+    let $n=$("#steamTracker_notificationArea");
+    if($n.length) $("<div>").css({color:"red",marginBottom:"5px"}).text(msg).appendTo($n);
+    log.e(msg);
+  };
+
+  /*--- MAIN UI ---*/
+  async function displayUI(){
+    let items=await GM.getValue(DATA_KEY,[]),
+        byGame=items.reduce((a,v)=>(a[v.game]=(a[v.game]||[]).concat(v),a),{});
+    let tabs=Object.keys(byGame).concat(["Stats & Goals","Settings"]),
+        $box=$("#steamTracker_box");
+    if(!$box.length){
+      $box=$("<div>",{id:"steamTracker_box"}).css({
+        position:"fixed",top:10,left:10,bgcolor:"#2c2c2c",color:"#f9f9f9",
+        padding:15,border:"1px solid #444",borderRadius:8,zIndex:999999,
+        maxHeight:500,overflowY:"auto",boxShadow:"0 4px 8px rgba(0,0,0,0.7)",
+        fontFamily:"Arial,sans-serif",fontSize:"13px",background:"#2c2c2c"
+      }).appendTo("body");
     }
+    let tabButtons = tabs.map(tab=>`
+      <button class="st_tabBtn" data-tab="${tab}" style="
+        background:#0073e6;color:#fff;border:none;padding:5px 10px;cursor:pointer;
+        border-radius:4px;font-size:12px;">${tab}</button>`).join("");
+    $box.html(`
+      <div style="display:flex;gap:5px;margin-bottom:10px;">
+        <button id="st_close" style="background:#d33;color:#fff;border:none;padding:5px 8px;cursor:pointer;border-radius:4px;">X</button>
+        <button id="st_min" style="background:#555;color:#fff;border:none;padding:5px 8px;cursor:pointer;border-radius:4px;">-</button>
+        ${tabButtons}
+      </div>
+      <div id="steamTracker_filterSortRow" style="margin-bottom:10px;">
+        <input id="st_filter" placeholder="Filter by name..." style="padding:3px;width:120px;"/>
+        <select id="st_sort" style="padding:3px;">
+          <option value="nameAsc">Name (A→Z)</option>
+          <option value="nameDesc">Name (Z→A)</option>
+          <option value="profitAsc">Profit (Asc)</option>
+          <option value="profitDesc" selected>Profit (Desc)</option>
+        </select>
+        <button id="st_apply" style="background:#28a745;color:#fff;border:none;padding:5px 8px;cursor:pointer;border-radius:4px;">Apply</button>
+      </div>
+      <div id="steamTracker_notificationArea" style="margin-bottom:5px;"></div>
+      <div id="st_content" style="margin-top:10px;"></div>
+    `);
 
-    /*************************************
-     *        HELPER: WAIT FOR ELEMENT
-     *************************************/
-    async function waitForElement(selector, timeout = 10000) {
-        const interval = 100;
-        const maxAttempts = timeout / interval;
-        let attempts = 0;
+    // Buttons
+    $("#st_close").on("click", ()=>$box.remove());
+    $("#st_min").on("click", ()=>{
+      let $c=$("#st_content"),$f=$("#steamTracker_filterSortRow");
+      $c.is(":visible")?($c.hide(),$f.hide()):($c.show(),$f.show());
+    });
+    $(".st_tabBtn").on("click",function(){
+      $(".st_tabBtn").removeClass("active");
+      $(this).addClass("active");
+      renderTab($(this).data("tab"), byGame, items);
+    });
+    $("#st_apply").on("click",function(){
+      let $btn=$(".st_tabBtn.active");
+      if($btn.length) renderTab($btn.data("tab"), byGame, items);
+    });
+    $(".st_tabBtn").first().click();
+  }
 
-        while (attempts < maxAttempts) {
-            const element = document.querySelector(selector);
-            if (element) return element;
-            await new Promise(resolve => setTimeout(resolve, interval));
-            attempts++;
-        }
-        throw new Error(`Element not found: ${selector}`);
+  /*--- RENDER TABS ---*/
+  function renderTab(tab, byGame, allItems){
+    let $c=$("#st_content");
+    if(tab==="Settings"){ $c.html(buildSettingsUI()); attachSettings(); return; }
+    if(tab==="Stats & Goals"){ $c.html(buildStats(allItems)); return; }
+    let arr=byGame[tab]||[], f=($("#st_filter").val()||"").toLowerCase(), s=$("#st_sort").val()||"profitDesc";
+    arr=arr.filter(i=>i.name.toLowerCase().includes(f));
+    switch(s){
+      case "nameAsc": arr.sort((a,b)=>a.name.localeCompare(b.name)); break;
+      case "nameDesc":arr.sort((a,b)=>b.name.localeCompare(a.name)); break;
+      case "profitAsc":arr.sort((a,b)=>a.profitMargin-b.profitMargin); break;
+      default: arr.sort((a,b)=>b.profitMargin-a.profitMargin);
     }
+    let html=`<button id="st_delAll" style="background:#d33;color:#fff;border:none;padding:4px 6px;cursor:pointer;border-radius:4px;margin-bottom:10px;">Delete All Items</button>`;
+    arr.forEach((it,ix)=>{
+      let c= it.profitMargin>=(it.thresholdUsed||0)?"lightgreen":"white";
+      html+=`
+      <div style="padding:5px 10px;border-bottom:1px solid #555;color:${c};display:flex;justify-content:space-between;">
+        <div>
+          ${ix+1}. <a href="${it.url}" target="_blank" style="color:#4da6ff;text-decoration:none;">${it.name}</a>
+          (AppID:${it.appId||"?"})
+          <br/>
+          <small>Buyer Quicksell: ${it.quicksellPrice.toFixed(2)}€ => Net: ${it.netQuicksellPrice.toFixed(2)}€ (fee:${Math.round(it.feeRateUsed*100)}%)</small><br/>
+          <small>SIH: ${it.sihPrice.toFixed(2)}€ | Profit: ${it.profitMargin.toFixed(2)}% (${it.diff.toFixed(2)}€)</small><br/>
+          <small style="color:#aaa;">[15% ref: ${it.netQuicksellPrice15.toFixed(2)}€]</small>
+        </div>
+        <span class="st_remove" data-name="${it.name}" style="color:#d33;cursor:pointer;font-weight:bold;">✖</span>
+      </div>`;
+    });
+    $c.html(html);
+    $("#st_delAll").on("click",()=> confirm("Delete ALL?") && removeAll());
+    $(".st_remove").on("click", function(){ let n=$(this).data("name"); confirm(`Remove "${n}"?`) && removeItem(n);});
+  }
 
-    /*************************************
-     *       URL PARSING FOR ITEM ID
-     *  Steam listing URL looks like:
-     *  /market/listings/730/AWP%20|%20Asiimov
-     *  => appId = 730, itemNameEncoded = AWP%20|%20Asiimov
-     *************************************/
-    function parseItemIdFromUrl() {
-        // e.g. path = "/market/listings/730/AWP%20Asiimov"
-        const path = window.location.pathname;
-        const match = path.match(/\/market\/listings\/(\d+)\/(.+)/);
-        if (!match) {
-            return { appId: null, itemNameEncoded: null };
-        }
-        return {
-            appId: match[1],
-            itemNameEncoded: match[2]
-        };
-    }
+  /*--- SETTINGS UI ---*/
+  function buildSettingsUI(){ return `
+    <h3 style="margin-top:0;">Settings</h3>
+    <label style="display:block;margin-bottom:8px;">Purge Interval (hours):
+      <input type="number" min="1" id="st_set_purge" style="width:60px;" />
+    </label>
+    <label style="display:block;margin-bottom:8px;">Profit Threshold (%):
+      <input type="number" id="st_set_profit" style="width:60px;" />
+    </label>
+    <button id="st_save" style="background:#28a745;color:#fff;padding:5px 10px;border:none;border-radius:4px;cursor:pointer;">Save Settings</button>
+  `;}
+  async function attachSettings(){
+    let [curInt, curPT] = await Promise.all([
+      GM.getValue(RESET_INTERVAL_KEY, DEFAULT_RESET_INTERVAL),
+      GM.getValue(PROFIT_THRESHOLD_KEY, DEFAULT_PROFIT_THRESH)
+    ]);
+    $("#st_set_purge").val(curInt/3600000 || 6);
+    $("#st_set_profit").val(curPT);
+    $("#st_save").on("click", async()=>{
+      let h=parseFloat($("#st_set_purge").val()), p=parseFloat($("#st_set_profit").val());
+      if(isNaN(h)||h<1) return alert("Purge interval must be >=1 hour.");
+      if(isNaN(p))       return alert("Profit threshold must be a number.");
+      await GM.setValue(RESET_INTERVAL_KEY,h*3600000);
+      await GM.setValue(PROFIT_THRESHOLD_KEY,p);
+      alert("Settings saved!");
+    });
+  }
 
-    /*************************************
-     *       PAGE + FEE DETECTION
-     *************************************/
-    function detectGame() {
-        const gameNameElement = document.querySelector("#largeiteminfo_game_name");
-        return gameNameElement ? gameNameElement.textContent.trim() : "default";
-    }
+  /*--- STATS & GOALS UI ---*/
+  function buildStats(arr){
+    if(!arr||!arr.length) return `<p>No items tracked yet.</p>`;
+    let total=arr.length, hi=arr.reduce((m,i)=>i.profitMargin>m.profitMargin?i:m,arr[0]);
+    if(!hi) return `<h3 style="margin-top:0;">Stats & Goals</h3><p><b>Total items tracked:</b> ${total}</p><p>No high-profit item.</p>`;
+    let deckCount=Math.ceil(STEAM_DECK_PRICE/hi.netQuicksellPrice),
+        deckCost =(deckCount*hi.sihPrice).toFixed(2),
+        vrCount =Math.ceil(VR_KIT_PRICE/hi.netQuicksellPrice),
+        vrCost  =(vrCount*hi.sihPrice).toFixed(2);
+    return `
+      <h3 style="margin-top:0;">Stats & Goals</h3>
+      <div style="margin-bottom:8px;"><b>Total items tracked:</b> ${total}</div>
+      <div style="margin-bottom:8px;">
+        <b>Highest Profit Item:</b>
+        <span style="color:lightgreen;font-weight:bold;">${hi.name} (${hi.profitMargin.toFixed(2)}%)</span>
+      </div>
+      <hr/>
+      <div style="margin-bottom:8px;">
+        <b>Steam Deck (569€):</b>
+        <p style="margin:4px 0;">Buy <em>${deckCount}</em> × <em>${hi.sihPrice.toFixed(2)}€</em> = <em>${deckCost}€</em> real money to net ~569€.</p>
+      </div>
+      <div style="margin-bottom:8px;">
+        <b>Valve Index VR Kit (1079€):</b>
+        <p style="margin:4px 0;">Buy <em>${vrCount}</em> × <em>${hi.sihPrice.toFixed(2)}€</em> = <em>${vrCost}€</em> real money to net ~1079€.</p>
+      </div>
+    `;
+  }
 
-    function isPageChanged() {
-        return window.location.href !== currentPageUrl;
-    }
-
-    /**
-     * Approximate Steam cut with a dynamic approach:
-     * For small amounts, the percentage is higher (e.g. 20% at 0.10).
-     * For larger amounts, ~13%. We also display net if we used a flat 15%.
-     */
-    function calculateDynamicSteamFee(buyerPays) {
-        let net, approxFeeRate;
-        if (buyerPays <= 1.0) {
-            // Simple linear approach from ~20% down to ~12%
-            approxFeeRate = 0.20 - (buyerPays * 0.08);
-            if (approxFeeRate < 0.12) approxFeeRate = 0.12;
-            if (approxFeeRate > 0.20) approxFeeRate = 0.20;
-        } else {
-            approxFeeRate = 0.13; // ~13% for amounts above 1 EUR
-        }
-        net = buyerPays * (1 - approxFeeRate);
-        // Mimic steam rounding
-        net = Math.floor(net * 100) / 100;
-
-        // Also compute net if we used a pure 15% for reference
-        const netUsing15Percent = Math.floor((buyerPays * (1 - 0.15)) * 100) / 100;
-
-        return {
-            net,
-            netUsing15Percent,
-            feeRateUsed: approxFeeRate
-        };
-    }
-
-    /*************************************
-     *        RESET LOGIC
-     *************************************/
-    async function resetDatabaseIfNeeded() {
-        const lastReset = await GM.getValue(LAST_RESET_TIME_KEY, null);
-        const now = Date.now();
-        const userDefinedInterval = await GM.getValue(RESET_INTERVAL_KEY, DEFAULT_RESET_INTERVAL);
-
-        if (!lastReset || now - new Date(lastReset).getTime() > userDefinedInterval) {
-            logInfo("Resetting database due to interval expiry...");
-            await GM.setValue(DATA_KEY, []);
-            await GM.setValue(LAST_RESET_TIME_KEY, new Date().toISOString());
-        }
-    }
-
-    /*************************************
-     *        FETCH WITH RETRIES
-     * Includes exponential backoff with cap
-     *************************************/
-    async function fetchWithRetry(url) {
-        let delayTime = 1000; // Start with 1 second
-        for (let i = 0; i < MAX_RETRIES; i++) {
-            if (isPageChanged()) {
-                logInfo("Page changed, halting fetch operation.");
-                return null;
-            }
-
-            const now = Date.now();
-            if (now - lastRequestTime < REQUEST_DELAY) {
-                const waitMs = REQUEST_DELAY - (now - lastRequestTime);
-                logDebug(`Waiting ${waitMs}ms to respect REQUEST_DELAY`);
-                await new Promise(resolve => setTimeout(resolve, waitMs));
-            }
-            lastRequestTime = Date.now();
-
-            try {
-                const response = await fetch(url);
-                if (response.ok) {
-                    // On success, reset the backoff
-                    delayTime = 1000;
-                    return await response.json();
-                }
-
-                if (response.status === 429) {
-                    logWarn(`Rate limit (429). Retrying in ${delayTime}ms (attempt ${i + 1}/${MAX_RETRIES})...`);
-                    await new Promise(resolve => setTimeout(resolve, delayTime));
-                    delayTime = Math.min(delayTime * 2, MAX_BACKOFF_TIME);
-                } else {
-                    throw new Error(`HTTP error! status: ${response.status}`);
-                }
-            } catch (error) {
-                logError(`Fetch attempt ${i + 1} failed:`, error);
-            }
-        }
-        logError("All retries failed for URL: " + url);
-        return null;
-    }
-
-    /*************************************
-     *       FETCH w/ CACHING
-     *************************************/
-    async function getCachedData(itemId) {
-        if (cache[itemId] && Date.now() - cache[itemId].timestamp < CACHE_EXPIRATION) {
-            return cache[itemId].data;
-        }
-        const data = await fetchWithRetry(`https://steamcommunity.com/market/itemordersactivity?item_nameid=${itemId}`);
-        if (data) {
-            cache[itemId] = { data, timestamp: Date.now() };
-        }
-        return data;
-    }
-
-    /*************************************
-     *   MERGE & STORE TRACKED ITEM
-     * (Multi-tab safe approach)
-     *************************************/
-    async function addOrUpdateItem(newData) {
-        let items = await GM.getValue(DATA_KEY, []);
-        const existingIndex = items.findIndex(item => item.name === newData.name);
-        if (existingIndex !== -1) {
-            items[existingIndex] = newData;
-            logDebug("Updated item in DB:", newData);
-        } else {
-            items.push(newData);
-            logDebug("Added new item to DB:", newData);
-        }
-        await GM.setValue(DATA_KEY, items);
-    }
-
-    /*************************************
-     *        REMOVE ITEM BY NAME
-     *************************************/
-    async function removeItemByName(name) {
-        let items = await GM.getValue(DATA_KEY, []);
-        items = items.filter(i => i.name !== name);
-        await GM.setValue(DATA_KEY, items);
-        displayTrackedItems(); // re-render
-    }
-
-    /*************************************
-     *        REMOVE ALL ITEMS
-     *************************************/
-    async function removeAllItems() {
-        await GM.setValue(DATA_KEY, []);
-        displayTrackedItems(); // re-render
-    }
-
-    /*************************************
-     *   SHOW FAILURE NOTIFICATION (UI)
-     *************************************/
-    function showFailureNotification(message) {
-        const notifArea = document.querySelector("#steamTracker_notificationArea");
-        if (notifArea) {
-            const div = document.createElement("div");
-            div.style.color = "red";
-            div.style.marginBottom = "5px";
-            div.textContent = message;
-            notifArea.appendChild(div);
-        }
-        logError(message);
-    }
-
-    /*************************************
-     *        DISPLAY TRACKED ITEMS
-     *************************************/
-    async function displayTrackedItems() {
-        const items = await GM.getValue(DATA_KEY, []);
-        // Group by game
-        const itemsByGame = items.reduce((acc, item) => {
-            if (!acc[item.game]) acc[item.game] = [];
-            acc[item.game].push(item);
-            return acc;
-        }, {});
-
-        // Build tabs list from game names + "Stats & Goals" + "Settings"
-        const tabs = Object.keys(itemsByGame).concat(["Stats & Goals", "Settings"]);
-
-        let box = document.querySelector("#steamTracker_trackedItemsBox");
-        if (!box) {
-            box = document.createElement('div');
-            box.id = "steamTracker_trackedItemsBox";
-            box.style.cssText = `
-                position: fixed;
-                top: 10px;
-                left: 10px;
-                background-color: #2c2c2c;
-                color: #f9f9f9;
-                padding: 15px;
-                border: 1px solid #444;
-                border-radius: 8px;
-                z-index: 999999;
-                max-height: 500px;
-                overflow-y: auto;
-                box-shadow: 0px 4px 8px rgba(0, 0, 0, 0.7);
-                font-family: Arial, sans-serif;
-                font-size: 13px;
-            `;
-            document.body.appendChild(box);
-        }
-
-        // UI scaffolding
-        box.innerHTML = `
-            <div style="display: flex; gap: 5px; margin-bottom: 10px;">
-                <button id="steamTracker_closeBtn" style="background: #d33; color: white; border: none; padding: 5px 8px; cursor: pointer; border-radius: 4px;">X</button>
-                <button id="steamTracker_minimizeBtn" style="background: #555; color: white; border: none; padding: 5px 8px; cursor: pointer; border-radius: 4px;">-</button>
-                ${tabs.map(tab => `
-                    <button class="steamTracker_tabButton" data-tab="${tab}" style="
-                        background: #0073e6;
-                        color: white;
-                        border: none;
-                        padding: 5px 10px;
-                        cursor: pointer;
-                        border-radius: 4px;
-                        font-size: 12px;
-                    ">${tab}</button>
-                `).join("")}
-            </div>
-            <!-- Filter + Sort row -->
-            <div id="steamTracker_filterSortRow" style="margin-bottom: 10px;">
-                <input type="text" id="steamTracker_filterInput" placeholder="Filter by name..." style="padding:3px;width:120px;" />
-                <select id="steamTracker_sortSelect" style="padding:3px;">
-                    <option value="nameAsc">Name (A→Z)</option>
-                    <option value="nameDesc">Name (Z→A)</option>
-                    <option value="profitAsc">Profit (Asc)</option>
-                    <option value="profitDesc" selected>Profit (Desc)</option>
-                </select>
-                <button id="steamTracker_applyFilterSort" style="background: #28a745; color: white; border: none; padding: 5px 8px; cursor: pointer; border-radius: 4px;">
-                    Apply
-                </button>
-            </div>
-            <div id="steamTracker_notificationArea" style="margin-bottom: 5px;"></div>
-            <div id="steamTracker_tabContent" style="margin-top: 10px;"></div>
-        `;
-
-        // close/minimize listeners
-        document.querySelector("#steamTracker_closeBtn").addEventListener("click", () => box.remove());
-        document.querySelector("#steamTracker_minimizeBtn").addEventListener("click", () => {
-            const content = document.querySelector("#steamTracker_tabContent");
-            const filterRow = document.querySelector("#steamTracker_filterSortRow");
-            if (content.style.display === "none") {
-                content.style.display = "block";
-                filterRow.style.display = "block";
-            } else {
-                content.style.display = "none";
-                filterRow.style.display = "none";
-            }
+  /*--- MAIN ---*/
+  async function main(){
+    log.i("Script start (Condensed + jQuery).");
+    await resetIfNeeded();
+    try{
+      let $n=await waitForElement(".market_listing_item_name"),
+          name=$n.text().trim(),
+          url=location.href,
+          game=detectGame(),
+          {appId}=parseItemIdFromUrl(),
+          $qs=await waitForElement("#market_commodity_buyrequests .market_commodity_orders_header_promote:nth-child(2)"),
+          qPrice=parseFloat($qs.text().trim().replace(/[^0-9.,-]/g,'').replace(',','.')),
+          $sih=await waitForElement("#sih_block_best_offer_of_marketplace_tabs_2 .sih_market__price"),
+          sPrice=parseFloat($sih.text().trim().replace(/[^0-9.,-]/g,'').replace(',','.'));
+      if(isNaN(qPrice)||isNaN(sPrice)) throw new Error("Invalid price data.");
+      let {net,net15,rate}=calcFee(qPrice), diff=net-sPrice, pm=(diff/sPrice)*100,
+          thr=await GM.getValue(PROFIT_THRESHOLD_KEY,DEFAULT_PROFIT_THRESH),
+          newItem={name,url,appId,quicksellPrice:qPrice,sihPrice:sPrice,netQuicksellPrice:net,netQuicksellPrice15:net15,diff,profitMargin:pm,feeRateUsed:rate,game,thresholdUsed:thr};
+      await addOrUpdateItem(newItem);
+      if(pm>=thr&&thr>0){
+        GM.notification({
+          text:`High-profit item: ${name} (${pm.toFixed(2)}% profit)`,
+          title:"Steam Market Arbitrage",
+          timeout:5000
         });
-
-        // Tab switching
-        const tabContent = box.querySelector("#steamTracker_tabContent");
-        document.querySelectorAll(".steamTracker_tabButton").forEach(button => {
-            button.addEventListener("click", () => {
-                const tab = button.getAttribute("data-tab");
-                renderTabContent(tab, itemsByGame, items, tabContent);
-            });
-        });
-
-        // Filter & sort
-        document.querySelector("#steamTracker_applyFilterSort").addEventListener("click", () => {
-            const activeTabBtn = document.querySelector(".steamTracker_tabButton.active");
-            if (activeTabBtn) {
-                const activeTab = activeTabBtn.getAttribute("data-tab");
-                renderTabContent(activeTab, itemsByGame, items, tabContent);
-            }
-        });
-
-        // Auto-click the first tab if it exists or fallback
-        const firstTabBtn = document.querySelector(".steamTracker_tabButton");
-        if (firstTabBtn) {
-            firstTabBtn.click();
-        }
-    }
-
-    /*************************************
-     *   RENDER TAB CONTENT (CORE)
-     *************************************/
-    async function renderTabContent(tab, itemsByGame, allItems, containerEl) {
-        // Mark active tab
-        document.querySelectorAll(".steamTracker_tabButton").forEach(btn => btn.classList.remove("active"));
-        const thisBtn = document.querySelector(`.steamTracker_tabButton[data-tab='${tab}']`);
-        if (thisBtn) thisBtn.classList.add("active");
-
-        const filterText = (document.querySelector("#steamTracker_filterInput")?.value || "").toLowerCase();
-        const sortMode   = document.querySelector("#steamTracker_sortSelect")?.value || "profitDesc";
-
-        // SETTINGS TAB
-        if (tab === "Settings") {
-            containerEl.innerHTML = buildSettingsHTML();
-            attachSettingsListeners();
-            return;
-        }
-
-        // STATS & GOALS TAB
-        if (tab === "Stats & Goals") {
-            containerEl.innerHTML = buildStatsGoalsHTML(allItems);
-            return;
-        }
-
-        // ELSE: It's a game tab
-        const items = itemsByGame[tab] || [];
-
-        // Filter
-        let filteredItems = items.filter(item => item.name.toLowerCase().includes(filterText));
-
-        // Sort
-        switch (sortMode) {
-            case "nameAsc":
-                filteredItems.sort((a, b) => a.name.localeCompare(b.name));
-                break;
-            case "nameDesc":
-                filteredItems.sort((a, b) => b.name.localeCompare(a.name));
-                break;
-            case "profitAsc":
-                filteredItems.sort((a, b) => a.profitMargin - b.profitMargin);
-                break;
-            default: // "profitDesc"
-                filteredItems.sort((a, b) => b.profitMargin - a.profitMargin);
-                break;
-        }
-
-        containerEl.innerHTML = `
-            <button id="steamTracker_deleteAllBtn" style="background: #d33; color: white; border: none; padding: 4px 6px; cursor: pointer; border-radius: 4px; margin-bottom:10px;">
-                Delete All Items
-            </button>
-            ${filteredItems.map((item, idx) => {
-                // color if profit >= threshold
-                const itemColor = item.profitMargin >= (item.thresholdUsed || 0)
-                    ? "lightgreen" : "white";
-                return `
-                    <div style="padding: 5px 10px; border-bottom: 1px solid #555; color: ${itemColor}; display:flex; align-items:center; justify-content:space-between;">
-                        <div>
-                            ${idx + 1}.
-                            <a href="${item.url}" target="_blank" style="color: #4da6ff; text-decoration: none;">
-                                ${item.name}
-                            </a> (AppID: ${item.appId || "?"})
-                            <br/>
-                            <small>
-                                Buyer Quicksell: ${item.quicksellPrice.toFixed(2)}€
-                                => Net: ${item.netQuicksellPrice.toFixed(2)}€
-                                (Approx fee: ${Math.round(item.feeRateUsed * 100)}%)
-                            </small>
-                            <br/>
-                            <small>SIH: ${item.sihPrice.toFixed(2)}€
-                                   | Profit: ${item.profitMargin.toFixed(2)}% (${item.diff.toFixed(2)}€)
-                            </small>
-                            <br/>
-                            <small style="color:#aaa;">
-                                [15% ref: ${item.netQuicksellPrice15.toFixed(2)}€]
-                            </small>
-                        </div>
-                        <span class="steamTracker_removeItem" data-item-name="${item.name}"
-                              style="color: #d33; cursor: pointer; font-weight:bold; margin-left:10px;">
-                            ✖
-                        </span>
-                    </div>
-                `;
-            }).join("")}
-        `;
-
-        // Attach "Delete All" listener
-        const deleteAllBtn = containerEl.querySelector("#steamTracker_deleteAllBtn");
-        if (deleteAllBtn) {
-            deleteAllBtn.addEventListener("click", () => {
-                if (confirm("Are you sure you want to delete ALL tracked items?")) {
-                    removeAllItems();
-                }
-            });
-        }
-
-        // Attach per-item remove
-        containerEl.querySelectorAll(".steamTracker_removeItem").forEach(el => {
-            el.addEventListener("click", e => {
-                const itemName = e.currentTarget.getAttribute("data-item-name");
-                if (itemName && confirm(`Remove "${itemName}"?`)) {
-                    removeItemByName(itemName);
-                }
-            });
-        });
-    }
-
-    /*************************************
-     *   BUILD HTML FOR SETTINGS TAB
-     *************************************/
-    function buildSettingsHTML() {
-        return `
-            <h3 style="margin-top:0;">Settings</h3>
-            <label style="display:block;margin-bottom:8px;">
-                Purge Interval (hours):
-                <input type="number" min="1" id="steamTracker_settings_purgeInterval" style="width:60px;" />
-            </label>
-            <label style="display:block;margin-bottom:8px;">
-                Profit Threshold (%):
-                <input type="number" id="steamTracker_settings_profitThreshold" style="width:60px;" />
-            </label>
-            <button id="steamTracker_settings_saveBtn" style="background: #28a745; color: white; padding: 5px 10px; border:none; border-radius:4px; cursor:pointer;">
-                Save Settings
-            </button>
-        `;
-    }
-
-    /*************************************
-     *    ATTACH SETTINGS LISTENERS
-     *************************************/
-    async function attachSettingsListeners() {
-        const purgeInput = document.querySelector("#steamTracker_settings_purgeInterval");
-        const profitInput = document.querySelector("#steamTracker_settings_profitThreshold");
-
-        const currentIntervalMs = await GM.getValue(RESET_INTERVAL_KEY, DEFAULT_RESET_INTERVAL);
-        const currentProfitTh   = await GM.getValue(PROFIT_THRESHOLD_KEY, DEFAULT_PROFIT_THRESHOLD);
-
-        purgeInput.value  = (currentIntervalMs / 3600000) || 6;
-        profitInput.value = currentProfitTh;
-
-        document.querySelector("#steamTracker_settings_saveBtn").addEventListener("click", async () => {
-            const hours = parseFloat(purgeInput.value);
-            const profitThVal = parseFloat(profitInput.value);
-
-            if (isNaN(hours) || hours < 1) {
-                alert("Purge interval must be >= 1 hour.");
-                return;
-            }
-            if (isNaN(profitThVal)) {
-                alert("Profit threshold must be a valid number.");
-                return;
-            }
-
-            await GM.setValue(RESET_INTERVAL_KEY, hours * 3600000);
-            await GM.setValue(PROFIT_THRESHOLD_KEY, profitThVal);
-
-            alert("Settings saved!");
-        });
-    }
-
-    /*************************************
-     *  BUILD HTML FOR STATS & GOALS TAB
-     *************************************/
-    function buildStatsGoalsHTML(allItems) {
-        if (!allItems || allItems.length === 0) {
-            return `<p>No items tracked yet.</p>`;
-        }
-
-        // 1) total items
-        const totalItems = allItems.length;
-
-        // 2) highest profit item
-        let highestProfitItem = null;
-        if (allItems.length > 0) {
-            highestProfitItem = allItems.reduce((max, item) => {
-                return item.profitMargin > max.profitMargin ? item : max;
-            }, allItems[0]);
-        }
-
-        if (!highestProfitItem) {
-            return `
-                <h3 style="margin-top:0;">Stats & Goals</h3>
-                <p><strong>Total items tracked:</strong> ${totalItems}</p>
-                <p>No highest profit item found yet.</p>
-            `;
-        }
-
-        // Calculate how many of the highest-profit item you'd need to buy at SIH price
-        // to get ~569€ or ~1079€ from net quicksell.
-        const deckNeededCount = Math.ceil(STEAM_DECK_PRICE / highestProfitItem.netQuicksellPrice);
-        const deckTotalCost   = (deckNeededCount * highestProfitItem.sihPrice).toFixed(2);
-
-        const vrNeededCount   = Math.ceil(VR_KIT_PRICE / highestProfitItem.netQuicksellPrice);
-        const vrTotalCost     = (vrNeededCount * highestProfitItem.sihPrice).toFixed(2);
-
-        return `
-            <h3 style="margin-top:0;">Stats & Goals</h3>
-            <div style="margin-bottom:8px;">
-                <strong>Total items tracked:</strong> ${totalItems}
-            </div>
-            <div style="margin-bottom:8px;">
-                <strong>Highest Profit Item:</strong>
-                <span style="color: lightgreen; font-weight:bold;">
-                    ${highestProfitItem.name} (${highestProfitItem.profitMargin.toFixed(2)}%)
-                </span>
-            </div>
-            <hr/>
-            <div style="margin-bottom:8px;">
-                <strong>Steam Deck (569€) using highest-profit item:</strong>
-                <p style="margin:4px 0;">
-                    You'd buy <em>${deckNeededCount}</em> × <em>${highestProfitItem.sihPrice.toFixed(2)}€</em>
-                    = <em>${deckTotalCost}€</em> of real money, to generate ~569€ in Steam wallet.
-                </p>
-            </div>
-            <div style="margin-bottom:8px;">
-                <strong>Valve Index VR Kit (1079€) using highest-profit item:</strong>
-                <p style="margin:4px 0;">
-                    You'd buy <em>${vrNeededCount}</em> × <em>${highestProfitItem.sihPrice.toFixed(2)}€</em>
-                    = <em>${vrTotalCost}€</em> of real money, to generate ~1079€ in Steam wallet.
-                </p>
-            </div>
-        `;
-    }
-
-    /*************************************
-     *          MAIN SCRIPT LOGIC
-     *************************************/
-    async function main() {
-        logInfo("Script started (Enhanced + Stats).");
-        await resetDatabaseIfNeeded();
-
-        try {
-            const nameEl = await waitForElement('.market_listing_item_name');
-            const name   = nameEl.textContent.trim();
-            const url    = window.location.href;
-            const gameName = detectGame();
-
-            // parse item ID from URL
-            const { appId, itemNameEncoded } = parseItemIdFromUrl();
-
-            // fetch quicksell price element
-            const quicksellPriceEl = await waitForElement('#market_commodity_buyrequests .market_commodity_orders_header_promote:nth-child(2)');
-            const quicksellRawStr  = quicksellPriceEl.textContent.trim().replace(/[^0-9.,-]/g, '').replace(',', '.');
-            const quicksellPrice   = parseFloat(quicksellRawStr);
-            if (isNaN(quicksellPrice)) {
-                throw new Error("Invalid or missing quicksell price.");
-            }
-
-            // fetch SIH price element
-            const sihPriceEl = await waitForElement('#sih_block_best_offer_of_marketplace_tabs_2 .sih_market__price');
-            const sihRawStr  = sihPriceEl.textContent.trim().replace(/[^0-9.,-]/g, '').replace(',', '.');
-            const sihPrice   = parseFloat(sihRawStr);
-            if (isNaN(sihPrice)) {
-                throw new Error("Invalid or missing SIH price.");
-            }
-
-            // dynamic fee calc
-            const { net: netDynamic, netUsing15Percent, feeRateUsed } = calculateDynamicSteamFee(quicksellPrice);
-
-            const diff         = netDynamic - sihPrice;
-            const profitMargin = (diff / sihPrice) * 100;
-
-            // user threshold
-            const userProfitThreshold = await GM.getValue(PROFIT_THRESHOLD_KEY, DEFAULT_PROFIT_THRESHOLD);
-
-            // build item record
-            const newItem = {
-                name,
-                url,
-                appId,
-                quicksellPrice,
-                sihPrice,
-                netQuicksellPrice: netDynamic,
-                netQuicksellPrice15: netUsing15Percent,
-                diff,
-                profitMargin,
-                feeRateUsed,
-                game: gameName,
-                thresholdUsed: userProfitThreshold
-            };
-            await addOrUpdateItem(newItem);
-
-            // Notification if >= threshold
-            if (profitMargin >= userProfitThreshold && userProfitThreshold > 0) {
-                GM.notification({
-                    text: `High-profit item found: ${name} at ${profitMargin.toFixed(2)}% profit!`,
-                    title: 'Steam Listing Tracker',
-                    timeout: 5000
-                });
-            }
-
-            // Show the UI
-            displayTrackedItems();
-
-        } catch (error) {
-            showFailureNotification("Error: " + error.message);
-            logError("An error occurred:", error);
-        }
-    }
-
-    main();
-
-    // TODO: [Future Feature] Implement historical data storage and trend charting
-    // TODO: [Future Feature] Fallback selectors if Steam layout changes
-    // TODO: [Future Feature] Central aggregator to fetch multiple listings at once
+      }
+      displayUI();
+    } catch(e){ showError("Error: "+e.message); log.e(e); }
+  }
+  main();
 })();
