@@ -1,0 +1,31 @@
+{
+  "name": "steam-market-arbitrage",
+  "version": "1.0.0",
+  "description": "Steam Market Arbitrage Calculator",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "build": "rollup -c",
+    "watch": "rollup -c -w",
+    "dev": "rollup -c -w"
+  },
+  "keywords": [
+    "steam",
+    "market",
+    "arbitrage",
+    "calculator",
+    "userscript"
+  ],
+  "author": "Rait Nigol",
+  "license": "MIT",
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^25.0.7",
+    "@rollup/plugin-node-resolve": "^15.2.3",
+    "@rollup/plugin-typescript": "^11.1.5",
+    "@types/node": "^20.10.5",
+    "rollup": "^4.9.1",
+    "rollup-plugin-terser": "^7.0.2",
+    "tslib": "^2.6.2",
+    "typescript": "^5.3.3"
+  }
+}
