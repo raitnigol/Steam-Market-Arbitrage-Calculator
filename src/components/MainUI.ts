@@ -759,6 +759,7 @@ const detectGameFromUrl = (url: string): string | null => {
     { pattern: /730|CS2|csgo|cs2/i, game: 'CS2' },
     { pattern: /440|TF2|tf2/i, game: 'TF2' },
     { pattern: /570|Dota|dota2/i, game: 'Dota 2' },
+    { pattern: /753|Steam/i, game: 'Steam' },
     // Add more games as needed
   ];
 
@@ -936,7 +937,8 @@ const normalizeGameName = (game: string): string => {
     'TF2': 'TF2',
     'Team Fortress 2': 'TF2',
     'Dota 2': 'Dota 2',
-    'DOTA2': 'Dota 2'
+    'DOTA2': 'Dota 2',
+    'Steam': 'Steam'
   };
   return gameMap[game] || game;
 }; 

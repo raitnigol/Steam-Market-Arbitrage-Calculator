@@ -2,4 +2,15 @@ node_modules/
 dist/
 coverage/
 .DS_Store
-*.log 
+*.log
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+*.sublime-*
+*.swp
+*.swo
+.npm
+.eslintcache
+.node_repl_history 

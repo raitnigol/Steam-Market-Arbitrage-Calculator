@@ -34,7 +34,23 @@ interface SIHPriceInfo {
 
 const findSIHPrice = async (): Promise<SIHPriceInfo | null> => {
   try {
-    // Keep trying to find SIH price for up to 30 seconds
+    // For Steam items (appId: 753), use native Steam price
+    const { appId } = extractGameInfo();
+    if (appId === '753') {
+      // Find the lowest sell order price
+      const priceElement = document.querySelector('#market_commodity_forsale_table .market_listing_price_with_fee');
+      if (priceElement) {
+        const priceText = priceElement.textContent?.trim() || '';
+        const price = extractPriceFromText(priceText);
+        if (price > 0) {
+          log.i(`Found Steam native price: ${price}`);
+          return { price };
+        }
+      }
+      return null;
+    }
+
+    // For game items, try SIH price
     const startTime = Date.now();
     const maxWaitTime = 30000; // 30 seconds
 
@@ -81,7 +97,7 @@ const findSIHPrice = async (): Promise<SIHPriceInfo | null> => {
     log.w('Timed out waiting for SIH price after 30 seconds');
     return null;
   } catch (error) {
-    log.w(`Failed to get SIH price: ${error}`);
+    log.w(`Failed to get price: ${error}`);
     return null;
   }
 };
@@ -128,8 +144,13 @@ const cleanupName = (name: string): string => {
   return name.replace(/[\n\t>]/g, '').replace(/\s+/g, ' ').trim();
 };
 
-const calculateNetPrice = (buyerPays: number): number => {
-  // Special cases based on observed patterns
+const calculateNetPrice = (buyerPays: number, appId?: string): number => {
+  // Steam items (appId: 753) have a flat 15% fee
+  if (appId === '753') {
+    return Math.floor(buyerPays * 0.85 * 100) / 100;
+  }
+
+  // Special cases based on observed patterns for game items
   if (buyerPays >= 0.03 && buyerPays <= 0.19) {
     return Math.max(0.01, buyerPays - 0.02);
   }
@@ -188,7 +209,7 @@ export const analyzeSingleItem = async (): Promise<MarketItem | null> => {
     const { game, appId } = extractGameInfo();
 
     // Extract prices
-    const [buyOrderPrice, sihInfo] = await Promise.all([
+    const [buyOrderPrice, priceInfo] = await Promise.all([
       findBuyOrderPrice(),
       findSIHPrice()
     ]);
@@ -198,16 +219,38 @@ export const analyzeSingleItem = async (): Promise<MarketItem | null> => {
       return null;
     }
 
-    if (!sihInfo) {
+    // For Steam items, we don't require SIH price
+    if (appId === '753' && !priceInfo) {
+      // Use buy order price as the reference price for Steam items
+      const netPrice = calculateNetPrice(buyOrderPrice, appId);
+      const item = {
+        name,
+        url: location.href,
+        appId,
+        game,
+        buyOrderPrice,
+        sihPrice: buyOrderPrice, // Use buy order price as reference
+        netPrice,
+        profit: 0, // No profit calculation for Steam items without SIH price
+        profitMargin: 0,
+        feeRate: 15, // Steam items have 15% fee
+        imageUrl
+      };
+      log.i(`Successfully analyzed Steam item: ${JSON.stringify(item, null, 2)}`);
+      return item;
+    }
+
+    // For game items, we still require SIH price
+    if (!priceInfo) {
       log.w('Failed to get SIH price. Please ensure Steam Inventory Helper is installed and enabled.');
       return null;
     }
 
     // Calculate net price and profits
-    const netPrice = calculateNetPrice(buyOrderPrice);
-    const profit = netPrice - sihInfo.price; // Profit = What you get - What you pay
-    const profitMargin = (profit / sihInfo.price) * 100; // ROI percentage
-    const feeRate = ((buyOrderPrice - netPrice) / buyOrderPrice) * 100; // Actual fee rate as percentage
+    const netPrice = calculateNetPrice(buyOrderPrice, appId);
+    const profit = netPrice - priceInfo.price;
+    const profitMargin = (profit / priceInfo.price) * 100;
+    const feeRate = ((buyOrderPrice - netPrice) / buyOrderPrice) * 100;
 
     const item = {
       name,
@@ -215,8 +258,8 @@ export const analyzeSingleItem = async (): Promise<MarketItem | null> => {
       appId,
       game,
       buyOrderPrice,
-      sihPrice: sihInfo.price,
-      sihInfo,
+      sihPrice: priceInfo.price,
+      sihInfo: priceInfo,
       netPrice,
       profit,
       profitMargin,
